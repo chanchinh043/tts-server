@@ -1,0 +1,26 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Config / secrets
+.env
+credentials/
+
+# DB
+*.db
+
+# Server working dirs (config.py)
+tts_output/
+tts_zips/
+tts_wav_tmp/
+
+# step3_package_zip.py chạy độc lập (dòng lệnh) — thư mục/state riêng
+packaged_audio/
+zips/
+version_state.json
+pending_upload.json
+
+# Editor
+.vscode/
+.idea/
