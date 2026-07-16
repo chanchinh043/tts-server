@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -40,12 +41,22 @@ from tts_server.engines.kokoro_engine import KokoroVoiceEngine
 
 logger = logging.getLogger("tts_server.job_processor")
 
+# ── Chu kỳ chạy dọn job đã XONG (ready/failed) quá hạn TTL — xem
+# jobs.cleanup_finished_jobs()/FINISHED_JOB_TTL_HOURS. Chạy 1 thread nền
+# RIÊNG với worker thread xử lý job (KHÔNG dùng chung _worker_loop) — dọn
+# dẹp không liên quan gì tới việc generate/encode/upload, tách riêng để lỗi
+# ở bên này (nếu có) không ảnh hưởng tới việc xử lý job thật, và ngược lại.
+# 1 giờ là đủ dày để DB không phình to giữa 2 lần dọn, nhưng đủ thưa để
+# không tốn tài nguyên vô ích (so với TTL 48h, chạy mỗi giờ vẫn rất dư dả).
+CLEANUP_INTERVAL_SECONDS = 60 * 60
+
 # ── Hàng đợi job — mỗi phần tử là 1 tuple (reading_id, sid, content_hash).
 # unbounded (maxsize=0) — số job đang chờ trong thực tế (1 người dùng cá
 # nhân) rất nhỏ, không cần giới hạn kích thước hàng đợi ở giai đoạn này. ────
 _job_queue: "queue.Queue[tuple[str, int, str]]" = queue.Queue()
 
 _worker_thread: Optional[threading.Thread] = None
+_cleanup_thread: Optional[threading.Thread] = None
 _engine: Optional[KokoroVoiceEngine] = None
 _engine_lock = threading.Lock()
 
@@ -210,6 +221,28 @@ def _worker_loop() -> None:
             _job_queue.task_done()
 
 
+def _cleanup_loop() -> None:
+    """Vòng lặp nền RIÊNG, chạy song song _worker_loop — định kỳ mỗi
+    CLEANUP_INTERVAL_SECONDS gọi jobs.cleanup_finished_jobs() để dọn job
+    ready/failed đã quá TTL. Ngủ TRƯỚC khi dọn lần đầu (không cần dọn ngay
+    lúc server vừa khởi động, DB vừa mới còn sạch) — vòng lặp vô hạn, lỗi ở
+    1 lần dọn KHÔNG được làm chết thread này (tương tự nguyên tắc bảo vệ
+    _worker_loop), chỉ log rồi chờ chu kỳ sau thử lại.
+    """
+    logger.info(
+        "_cleanup_loop: cleanup thread đã khởi động (mỗi %d giây, TTL=%d giờ)",
+        CLEANUP_INTERVAL_SECONDS, jobs.FINISHED_JOB_TTL_HOURS,
+    )
+    while True:
+        time.sleep(CLEANUP_INTERVAL_SECONDS)
+        try:
+            deleted = jobs.cleanup_finished_jobs()
+            if deleted > 0:
+                logger.info("_cleanup_loop: đã dọn %d job ready/failed quá hạn TTL", deleted)
+        except Exception:
+            logger.exception("_cleanup_loop: lỗi khi dọn job quá hạn — thử lại chu kỳ sau")
+
+
 def enqueue_job(reading_id: str, sid: int, content_hash: str) -> None:
     """Đưa 1 job vào hàng đợi xử lý nền — gọi từ main.py NGAY SAU
     jobs.create_or_get_job() khi job vừa được TẠO MỚI (status vừa trả về là
@@ -227,21 +260,29 @@ def start_worker() -> None:
     thread worker nền. AN TOÀN gọi lặp lại (vd --reload của uvicorn có thể
     trigger startup event nhiều lần) — no-op nếu thread đã chạy.
     """
-    global _worker_thread
-    if _worker_thread is not None and _worker_thread.is_alive():
-        return
+    global _worker_thread, _cleanup_thread
+    if _worker_thread is None or not _worker_thread.is_alive():
+        _worker_thread = threading.Thread(target=_worker_loop, name="tts-job-worker", daemon=True)
+        _worker_thread.start()
 
-    _worker_thread = threading.Thread(target=_worker_loop, name="tts-job-worker", daemon=True)
-    _worker_thread.start()
+        # ── Khôi phục job dở dang từ lần chạy trước (server bị tắt/restart
+        # giữa chừng khi đang có job 'pending'/'processing') — KHÔNG để
+        # chúng nằm im mãi mãi trong DB, tự enqueue lại để worker xử lý
+        # tiếp. Job đang 'processing' cũ (dở dang thật sự, không phải chỉ
+        # mới ghi status) sẽ được xử lý LẠI TỪ ĐẦU (generate lại toàn bộ) —
+        # chấp nhận được vì generate() không có tác dụng phụ gì ngoài tốn
+        # thời gian CPU. ────────────────────────────────────────────────
+        unfinished = jobs.get_unfinished_jobs()
+        if unfinished:
+            logger.info("start_worker: khôi phục %d job dở dang từ lần chạy trước", len(unfinished))
+            for reading_id, sid, content_hash in unfinished:
+                enqueue_job(reading_id, sid, content_hash)
 
-    # ── Khôi phục job dở dang từ lần chạy trước (server bị tắt/restart giữa
-    # chừng khi đang có job 'pending'/'processing') — KHÔNG để chúng nằm im
-    # mãi mãi trong DB, tự enqueue lại để worker xử lý tiếp. Job đang
-    # 'processing' cũ (dở dang thật sự, không phải chỉ mới ghi status) sẽ
-    # được xử lý LẠI TỪ ĐẦU (generate lại toàn bộ) — chấp nhận được vì
-    # generate() không có tác dụng phụ gì ngoài tốn thời gian CPU. ─────────
-    unfinished = jobs.get_unfinished_jobs()
-    if unfinished:
-        logger.info("start_worker: khôi phục %d job dở dang từ lần chạy trước", len(unfinished))
-        for reading_id, sid, content_hash in unfinished:
-            enqueue_job(reading_id, sid, content_hash)
+    # ── Guard RIÊNG cho cleanup thread — tách khỏi guard của _worker_thread
+    # ở trên để 2 thread độc lập nhau: dù 1 trong 2 vì lý do gì đó đã chết
+    # (không nên xảy ra vì cả 2 đều tự bắt Exception trong vòng lặp, nhưng
+    # phòng hờ), gọi lại start_worker() vẫn tự khởi động lại đúng thread bị
+    # chết mà không đụng tới thread còn lại đang chạy tốt. ─────────────────
+    if _cleanup_thread is None or not _cleanup_thread.is_alive():
+        _cleanup_thread = threading.Thread(target=_cleanup_loop, name="tts-job-cleanup", daemon=True)
+        _cleanup_thread.start()

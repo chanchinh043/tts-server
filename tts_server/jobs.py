@@ -18,11 +18,23 @@
 # connection pool hoặc Postgres.
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 DB_PATH = Path(__file__).resolve().parent.parent / "tts_myreading_jobs.db"
+
+# ── TTL cho job đã XONG (ready/failed) trước khi bị dọn khỏi bảng ────────
+# ⚠️ KHÔNG xoá ngay lúc job vừa 'ready'/'failed' — GET /tts/myreading/status
+# đang dùng "không tìm thấy job" để nghĩa là "chưa sẵn sàng" (an toàn, xem
+# TtsMyReadingDownloadGate.kt: mọi giá trị khác ngoài READY đều bị coi là
+# "chưa xong, thử lại sau"). Nếu xoá ngay, 1 thiết bị KHÁC hoặc
+# TtsMyReadingPrecacheWorker đang poll đúng job đó SẼ đọc nhầm thành "chưa
+# xử lý" dù thực ra đã ready/failed từ trước — mất tín hiệu, hoặc tệ hơn,
+# dữ liệu cũ bị hiểu sai. Giữ lại đủ lâu (mặc định 48 giờ) để MỌI thiết bị
+# đang chờ (kể cả offline một thời gian) kịp poll thấy đúng trạng thái
+# trước khi job bị dọn — sau đó coi như đã "hết hạn nhận", dọn cho gọn DB.
+FINISHED_JOB_TTL_HOURS = 48
 
 _lock = threading.Lock()
 _conn: Optional[sqlite3.Connection] = None
@@ -165,3 +177,32 @@ def get_unfinished_jobs() -> list[tuple[str, int, str]]:
         """
     ).fetchall()
     return [(r[0], r[1], r[2]) for r in rows]
+
+
+# ── Dọn job đã XONG (ready/failed) quá hạn TTL — "1 chỗ lưu request, cái
+# nào xử lý xong thì xoá đi" mà vẫn AN TOÀN với cách status-check hiện tại
+# (xem giải thích TTL ở đầu file). CHỈ đụng tới job có status ready/failed
+# VÀ updated_at cũ hơn cutoff — KHÔNG BAO GIỜ đụng tới pending/processing
+# dù chúng có cũ tới đâu (job kẹt lâu là dấu hiệu cần xem log, không phải
+# tự dọn — dọn nhầm sẽ làm mất luôn job đang dở, không ai enqueue lại được
+# nữa vì content_hash đó đã bị Android coi là "đã gửi" nếu bước 2 hoàn
+# thành sau này).
+#
+# ttl_hours: cho phép override khi gọi (vd test) — mặc định dùng
+# FINISHED_JOB_TTL_HOURS ở trên.
+#
+# Trả về số job đã xoá — caller (job_processor cleanup loop) chỉ cần log,
+# không cần xử lý gì thêm.
+def cleanup_finished_jobs(ttl_hours: int = FINISHED_JOB_TTL_HOURS) -> int:
+    conn = _require_conn()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=ttl_hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _lock:
+        cursor = conn.execute(
+            """
+            DELETE FROM tts_myreading_jobs
+            WHERE status IN ('ready', 'failed') AND updated_at < ?
+            """,
+            (cutoff,),
+        )
+        conn.commit()
+        return cursor.rowcount

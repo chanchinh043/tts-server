@@ -41,7 +41,7 @@ import json
 import logging
 from enum import Enum
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from tts_server import jobs, job_processor
@@ -122,7 +122,29 @@ async def request_synthesis(body: SynthesisRequest) -> StatusResponse:
     # — an toàn khi Android gọi lặp lại (retry mạng, mở bài nhiều lần...).
     # Job vừa tạo LUÔN có status='pending' — CHƯA có gì xử lý nó cho tới
     # bước 8 (job processor). ────────────────────────────────────────────
-    status = jobs.create_or_get_job(body.readingId, body.sid, body.contentHash, items_json)
+    #
+    # ⚠️ BỌC RÕ RÀNG: đây là bước "lưu request xuống DB" — Android chỉ nên
+    # coi request là ĐÃ ĐƯỢC SERVER NHẬN khi nhận về HTTP 200 kèm status hợp
+    # lệ (xem TtsMyReadingSentRequestStore.kt phía Android, chỉ ghi nhớ "đã
+    # gửi" SAU KHI có response thành công). Nếu ghi DB lỗi (đĩa đầy, DB
+    # khoá, lỗi I/O...), PHẢI trả lỗi HTTP thật (503) để Android hiểu "chưa
+    # lưu được, cần thử lại" — TUYỆT ĐỐI không được nuốt lỗi rồi trả về 1
+    # status giả (vd mặc định 'pending') vì Android sẽ tưởng nhầm là server
+    # đã nhận và ghi nhớ "đã gửi", trong khi thực ra job không hề tồn tại
+    # trong DB — bài đó sẽ mãi mãi không bao giờ có audio.
+    try:
+        status = jobs.create_or_get_job(body.readingId, body.sid, body.contentHash, items_json)
+    except Exception:
+        logger.exception(
+            "request_synthesis: LỖI GHI DB cho readingId=%s sid=%d contentHash=%s — "
+            "trả 503, Android cần thử lại sau",
+            body.readingId, body.sid, body.contentHash,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Server không lưu được request lúc này, vui lòng thử lại sau.",
+        )
+
     logger.info(
         "request_synthesis: readingId=%s sid=%d contentHash=%s items=%d → status=%s",
         body.readingId, body.sid, body.contentHash, len(body.items), status,
