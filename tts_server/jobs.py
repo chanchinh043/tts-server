@@ -1,21 +1,18 @@
 # tts_server/jobs.py
 #
-# Quản lý bảng job DUY NHẤT của server — thay thế hoàn toàn việc trả cứng
-# "pending" ở main.py bước 1. Dùng SQLite (đủ dùng cho quy mô 1 server, dễ
-# backup — chỉ 1 file .db) — có thể đổi sang Postgres sau này nếu cần nhiều
-# worker chạy song song, nhưng KHÔNG cần thiết ở giai đoạn này.
+# Quản lý bảng job DUY NHẤT của server.
 #
-# ── SCHEMA ────────────────────────────────────────────────────────────────
-# PRIMARY KEY (reading_id, sid, content_hash) — đúng khoá dedup mà Android
-# (TtsMyReadingRequestClient.kt) đã giả định: 2 thiết bị/2 lần gọi trùng cả
-# 3 giá trị này chỉ tạo ra ĐÚNG 1 job, an toàn khi gọi lặp lại.
-#
-# ── AN TOÀN ĐA LUỒNG ─────────────────────────────────────────────────────
-# sqlite3 connection không an toàn dùng chung giữa nhiều thread mặc định —
-# dùng check_same_thread=False + 1 threading.Lock bọc quanh mọi thao tác ghi
-# (insert/update). Đơn giản, đủ dùng cho lưu lượng thấp ở giai đoạn hiện
-# tại — nếu sau này cần xử lý đồng thời nhiều job nặng, cân nhắc đổi sang
-# connection pool hoặc Postgres.
+# ── CẬP NHẬT: RETRY ──────────────────────────────────────────────────────
+# Thêm 2 cột: retry_count (số lần đã tự động thử lại) và last_error (lỗi
+# gần nhất, để debug/hiển thị). Có 2 cơ chế retry:
+#   1. AUTO-RETRY (job_processor.py): lỗi tạm thời (mạng, Drive timeout...)
+#      → tự enqueue lại tối đa MAX_RETRIES lần, có backoff — xem
+#      job_processor._fail_or_retry().
+#   2. MANUAL RETRY (create_or_get_job dưới đây): nếu Android gọi lại
+#      request_synthesis() cho đúng job đã 'failed' (hết auto-retry, hoặc
+#      lỗi cần người sửa như OAuth token) → job được RESET về 'pending' và
+#      main.py sẽ tự enqueue lại (vì logic ở main.py chỉ enqueue khi status
+#      vừa đọc lại là 'pending').
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
@@ -24,16 +21,6 @@ from typing import Optional
 
 DB_PATH = Path(__file__).resolve().parent.parent / "tts_myreading_jobs.db"
 
-# ── TTL cho job đã XONG (ready/failed) trước khi bị dọn khỏi bảng ────────
-# ⚠️ KHÔNG xoá ngay lúc job vừa 'ready'/'failed' — GET /tts/myreading/status
-# đang dùng "không tìm thấy job" để nghĩa là "chưa sẵn sàng" (an toàn, xem
-# TtsMyReadingDownloadGate.kt: mọi giá trị khác ngoài READY đều bị coi là
-# "chưa xong, thử lại sau"). Nếu xoá ngay, 1 thiết bị KHÁC hoặc
-# TtsMyReadingPrecacheWorker đang poll đúng job đó SẼ đọc nhầm thành "chưa
-# xử lý" dù thực ra đã ready/failed từ trước — mất tín hiệu, hoặc tệ hơn,
-# dữ liệu cũ bị hiểu sai. Giữ lại đủ lâu (mặc định 48 giờ) để MỌI thiết bị
-# đang chờ (kể cả offline một thời gian) kịp poll thấy đúng trạng thái
-# trước khi job bị dọn — sau đó coi như đã "hết hạn nhận", dọn cho gọn DB.
 FINISHED_JOB_TTL_HOURS = 48
 
 _lock = threading.Lock()
@@ -42,6 +29,11 @@ _conn: Optional[sqlite3.Connection] = None
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(r[1] == column for r in rows)
 
 
 def init_db(db_path: Path = DB_PATH) -> None:
@@ -63,6 +55,17 @@ def init_db(db_path: Path = DB_PATH) -> None:
             )
             """
         )
+        # ── Migration an toàn cho DB đã tồn tại từ trước (chưa có 2 cột
+        # mới) — ALTER TABLE ADD COLUMN chỉ chạy nếu cột CHƯA có, tránh lỗi
+        # "duplicate column" mỗi lần server khởi động lại. ─────────────────
+        if not _column_exists(_conn, "tts_myreading_jobs", "retry_count"):
+            _conn.execute(
+                "ALTER TABLE tts_myreading_jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if not _column_exists(_conn, "tts_myreading_jobs", "last_error"):
+            _conn.execute(
+                "ALTER TABLE tts_myreading_jobs ADD COLUMN last_error TEXT"
+            )
         _conn.commit()
 
 
@@ -72,21 +75,20 @@ def _require_conn() -> sqlite3.Connection:
     return _conn
 
 
-# ── Gọi từ POST /tts/myreading/request — tạo job nếu chưa có, hoặc trả về
-# status của job ĐÃ tồn tại nếu trùng (reading_id, sid, content_hash). AN
-# TOÀN khi gọi lặp lại nhiều lần/nhiều thiết bị — INSERT OR IGNORE không ghi
-# đè job đã có, dòng SELECT sau đó luôn đọc lại đúng trạng thái hiện tại
-# (dù job đó vừa được TẠO MỚI ở chính lệnh INSERT này hay đã tồn tại từ
-# trước). ────────────────────────────────────────────────────────────────
-#
-# items_json: JSON-encode sẵn của list [{"type","itemId","textEn"}, ...] do
-# Android gửi kèm — CHÍNH LÀ toàn bộ nội dung cần tổng hợp giọng, KHÔNG có
-# nguồn nào khác (server không tự đi hỏi Supabase). Chỉ được LƯU LẦN ĐẦU
-# job được tạo — nếu job đã tồn tại (trùng contentHash = trùng nội dung),
-# KHÔNG ghi đè items_json cũ, vì về mặt logic 2 lần gửi với cùng
-# contentHash PHẢI có items giống hệt nhau (contentHash được tính từ chính
-# text đó ở phía Android — xem TtsMyReadingContentHash.kt).
 def create_or_get_job(reading_id: str, sid: int, content_hash: str, items_json: str) -> str:
+    """Tạo job mới nếu chưa có, hoặc trả về status của job đã tồn tại.
+
+    ⚠️ CẬP NHẬT RETRY: nếu job đã tồn tại và đang ở status 'failed', COI
+    LẦN GỌI NÀY LÀ YÊU CẦU THỬ LẠI — reset về 'pending', retry_count=0,
+    xoá last_error, rồi trả về 'pending' (main.py sẽ tự enqueue lại vì nó
+    chỉ enqueue khi status đọc được là 'pending'). Đây là cách retry thủ
+    công tự nhiên nhất: Android không cần biết gì về khái niệm "retry" —
+    chỉ cần gọi lại đúng request cũ (TtsMyReadingSyncTrigger vốn đã làm
+    việc này định kỳ) là job cũ được hồi sinh.
+
+    Job đang 'pending'/'processing'/'ready' thì giữ nguyên, KHÔNG đụng gì
+    (tránh xử lý trùng vô ích hoặc phá vỡ dedup theo content_hash).
+    """
     conn = _require_conn()
     now = _now_iso()
     with _lock:
@@ -98,7 +100,7 @@ def create_or_get_job(reading_id: str, sid: int, content_hash: str, items_json: 
             """,
             (reading_id, sid, content_hash, items_json, now, now),
         )
-        conn.commit()
+
         row = conn.execute(
             """
             SELECT status FROM tts_myreading_jobs
@@ -106,12 +108,24 @@ def create_or_get_job(reading_id: str, sid: int, content_hash: str, items_json: 
             """,
             (reading_id, sid, content_hash),
         ).fetchone()
-    return row[0] if row else "pending"
+
+        status = row[0] if row else "pending"
+
+        if status == "failed":
+            conn.execute(
+                """
+                UPDATE tts_myreading_jobs
+                SET status = 'pending', retry_count = 0, last_error = NULL, updated_at = ?
+                WHERE reading_id = ? AND sid = ? AND content_hash = ?
+                """,
+                (now, reading_id, sid, content_hash),
+            )
+            status = "pending"
+
+        conn.commit()
+    return status
 
 
-# ── Lấy lại items đã lưu của 1 job — dùng bởi job processor (bước 8, chưa
-# làm) để có text cần generate, KHÔNG cần hỏi Supabase hay bất kỳ nguồn nào
-# khác. Trả về [] nếu job không tồn tại (không throw). ────────────────────
 def get_job_items(reading_id: str, sid: int, content_hash: str) -> list[dict]:
     import json
 
@@ -131,10 +145,6 @@ def get_job_items(reading_id: str, sid: int, content_hash: str) -> list[dict]:
         return []
 
 
-# ── Gọi từ GET /tts/myreading/status — chỉ ĐỌC, không tạo job mới. Trả về
-# None nếu chưa từng có job nào khớp đúng 3 giá trị này (chưa từng
-# requestSynthesis(), hoặc contentHash đã đổi vì nội dung bài thay đổi) —
-# caller (main.py) tự quyết định map None thành giá trị gì trả về Android. ──
 def get_job_status(reading_id: str, sid: int, content_hash: str) -> Optional[str]:
     conn = _require_conn()
     row = conn.execute(
@@ -147,26 +157,57 @@ def get_job_status(reading_id: str, sid: int, content_hash: str) -> Optional[str
     return row[0] if row else None
 
 
-# ── Cập nhật status — dùng bởi job processor (bước 8, chưa làm) khi
-# generate/encode/upload xong (→ 'ready') hoặc lỗi (→ 'failed'). Đặt sẵn ở
-# đây từ bước 3 dù chưa có nơi gọi, để không phải sửa lại schema/module này
-# lần nữa ở bước 8. ──────────────────────────────────────────────────────
-def update_job_status(reading_id: str, sid: int, content_hash: str, status: str) -> None:
+def update_job_status(
+    reading_id: str,
+    sid: int,
+    content_hash: str,
+    status: str,
+    error: Optional[str] = None,
+) -> None:
+    """Cập nhật status — như cũ, nhưng nhận thêm `error` (tuỳ chọn) để lưu
+    vào last_error khi status='failed'. Khi status khác 'failed' (vd
+    'processing', 'ready'), error luôn bị bỏ qua/xoá — last_error chỉ có ý
+    nghĩa khi job đang ở trạng thái failed.
+    """
     conn = _require_conn()
     with _lock:
         conn.execute(
             """
             UPDATE tts_myreading_jobs
-            SET status = ?, updated_at = ?
+            SET status = ?, updated_at = ?, last_error = ?
             WHERE reading_id = ? AND sid = ? AND content_hash = ?
             """,
-            (status, _now_iso(), reading_id, sid, content_hash),
+            (status, _now_iso(), error if status == "failed" else None, reading_id, sid, content_hash),
         )
         conn.commit()
 
 
-# ── Toàn bộ job đang pending/processing — dùng bởi job processor (bước 8)
-# để biết cần xử lý những gì, KHÔNG cần server tự nhớ thêm ở đâu khác. ─────
+def increment_retry(reading_id: str, sid: int, content_hash: str) -> int:
+    """Tăng retry_count lên 1, trả về giá trị MỚI sau khi tăng — dùng bởi
+    job_processor._fail_or_retry() để quyết định còn được tự động thử lại
+    nữa hay không (so với MAX_RETRIES).
+    """
+    conn = _require_conn()
+    with _lock:
+        conn.execute(
+            """
+            UPDATE tts_myreading_jobs
+            SET retry_count = retry_count + 1, updated_at = ?
+            WHERE reading_id = ? AND sid = ? AND content_hash = ?
+            """,
+            (_now_iso(), reading_id, sid, content_hash),
+        )
+        conn.commit()
+        row = conn.execute(
+            """
+            SELECT retry_count FROM tts_myreading_jobs
+            WHERE reading_id = ? AND sid = ? AND content_hash = ?
+            """,
+            (reading_id, sid, content_hash),
+        ).fetchone()
+    return row[0] if row else 0
+
+
 def get_unfinished_jobs() -> list[tuple[str, int, str]]:
     conn = _require_conn()
     rows = conn.execute(
@@ -179,20 +220,6 @@ def get_unfinished_jobs() -> list[tuple[str, int, str]]:
     return [(r[0], r[1], r[2]) for r in rows]
 
 
-# ── Dọn job đã XONG (ready/failed) quá hạn TTL — "1 chỗ lưu request, cái
-# nào xử lý xong thì xoá đi" mà vẫn AN TOÀN với cách status-check hiện tại
-# (xem giải thích TTL ở đầu file). CHỈ đụng tới job có status ready/failed
-# VÀ updated_at cũ hơn cutoff — KHÔNG BAO GIỜ đụng tới pending/processing
-# dù chúng có cũ tới đâu (job kẹt lâu là dấu hiệu cần xem log, không phải
-# tự dọn — dọn nhầm sẽ làm mất luôn job đang dở, không ai enqueue lại được
-# nữa vì content_hash đó đã bị Android coi là "đã gửi" nếu bước 2 hoàn
-# thành sau này).
-#
-# ttl_hours: cho phép override khi gọi (vd test) — mặc định dùng
-# FINISHED_JOB_TTL_HOURS ở trên.
-#
-# Trả về số job đã xoá — caller (job_processor cleanup loop) chỉ cần log,
-# không cần xử lý gì thêm.
 def cleanup_finished_jobs(ttl_hours: int = FINISHED_JOB_TTL_HOURS) -> int:
     conn = _require_conn()
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=ttl_hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
