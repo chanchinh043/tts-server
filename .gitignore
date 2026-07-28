@@ -10,6 +10,13 @@ credentials/
 # DB
 *.db
 
+# Audio data — chặn theo PHẦN MỞ RỘNG (an toàn hơn chỉ chặn theo thư mục,
+# vì file audio có thể lỡ tay tạo/test ở bất kỳ đâu trong repo)
+*.wav
+*.ogg
+*.opus
+*.mp3
+
 # Server working dirs (config.py)
 tts_output/
 tts_zips/
@@ -25,6 +32,6 @@ pending_upload.json
 .vscode/
 .idea/
 
-#bỏ qua thư mục generate thủ công
+# bỏ qua thư mục generate thủ công
 generated_audio/
 db/
