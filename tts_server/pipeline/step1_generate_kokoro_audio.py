@@ -82,7 +82,17 @@ SIDS = [2, 3, 9, 11, 16, 26]
 # Chỉ generate các reading_id này. Để [] = TOÀN BỘ bài trong DB.
 READING_IDS: list = []
 
-SPEED = 1.0
+# Tốc độ đọc — TÁCH RIÊNG theo item_type, vì word (đọc rời từng từ) cần
+# giữ tốc độ chuẩn để phát âm rõ, còn sentence/phrase (đọc liền mạch) đọc
+# chậm hơn cho dễ nghe. Đặt Ở ĐÂY (trong pipeline generate), KHÔNG phải ở
+# server (job_processor.py) hay batch script gọi nó — vì CẢ 2 nơi đó đều
+# gọi chung generate_with_fallback() bên dưới, đặt tốc độ ở tầng này đảm
+# bảo audio bài hệ thống (batch, upload Drive thủ công) và audio MyReading
+# (server, tự động) LUÔN cùng 1 tốc độ cho cùng 1 loại item, không thể bị
+# lệch do quên đồng bộ ở 2 nơi gọi khác nhau.
+SPEED_WORD = 1.0
+SPEED_SENTENCE = 0.90
+SPEED_PHRASE = 0.90
 NUM_THREADS = 2
 # ══════════════════════════════════════════════════════════════════════
 
@@ -107,7 +117,6 @@ DEFAULT_OUTPUT_DIR = Path(OUTPUT_DIR) if OUTPUT_DIR else SCRIPT_DIR / "generated
 DEFAULT_MODEL_DIR = Path(MODEL_DIR) if MODEL_DIR else SCRIPT_DIR / "kokoro"
 DEFAULT_SIDS = SIDS
 DEFAULT_READING_IDS = READING_IDS or None
-DEFAULT_SPEED = SPEED
 DEFAULT_NUM_THREADS = NUM_THREADS
 
 try:
@@ -142,6 +151,30 @@ for _group in VOICE_GROUPS:
 
 def fallback_chain_of(sid: int) -> List[int]:
     return _FALLBACK_CHAIN.get(sid, [])
+
+
+# ── Tra cứu tốc độ theo item_type — DUY NHẤT nơi quyết định "loại item nào
+# đọc tốc độ bao nhiêu" trong toàn hệ thống. generate_with_fallback() bên
+# dưới gọi hàm này thay vì nhận speed từ caller — server (job_processor.py)
+# và batch script bài hệ thống chỉ cần truyền item_type, KHÔNG tự quyết
+# định/tính speed ở tầng của mình nữa, tránh lệch tốc độ giữa 2 nguồn audio.
+_SPEED_BY_TYPE: Dict[str, float] = {
+    "word": SPEED_WORD,
+    "sentence": SPEED_SENTENCE,
+    "phrase": SPEED_PHRASE,
+}
+_DEFAULT_SPEED_FOR_UNKNOWN_TYPE = SPEED_SENTENCE
+
+
+def get_speed_for_type(item_type: str) -> float:
+    speed = _SPEED_BY_TYPE.get(item_type)
+    if speed is None:
+        print(
+            f"    ⚠ get_speed_for_type: item_type={item_type!r} không thuộc "
+            f"{list(_SPEED_BY_TYPE.keys())}, dùng mặc định {_DEFAULT_SPEED_FOR_UNKNOWN_TYPE}"
+        )
+        return _DEFAULT_SPEED_FOR_UNKNOWN_TYPE
+    return speed
 
 
 # ── Data model đọc từ DB — khớp ý nghĩa TtsWordItem/TtsSentenceItem/
@@ -326,12 +359,17 @@ def generate_with_fallback(
     tts: "sherpa_onnx.OfflineTts",
     text: str,
     primary_sid: int,
-    speed: float,
+    item_type: str,
 ) -> Optional[tuple]:
     # ── Trả về (samples, sample_rate, sid_dùng_để_generate) nếu thành công,
     # None nếu HẾT TOÀN BỘ chuỗi giọng mà vẫn câm — cùng tinh thần
     # repairSilentItem() bên TtsPregenWorker.kt (thử giọng gốc trước, hết
     # MAX_ATTEMPTS_PER_VOICE lần vẫn câm thì sang giọng kế tiếp cùng nhóm). ─
+    #
+    # ⚠️ speed KHÔNG còn là tham số nhận từ caller — tự tra theo item_type
+    # qua get_speed_for_type() ở trên, để CẢ server lẫn batch script gọi
+    # hàm này đều dùng chung đúng 1 chính sách tốc độ, không thể lệch nhau.
+    speed = get_speed_for_type(item_type)
     sid_chain = [primary_sid] + fallback_chain_of(primary_sid)
 
     for sid in sid_chain:
@@ -421,7 +459,7 @@ def run(args: argparse.Namespace) -> None:
                     # thì không generate lại).
                     continue
 
-                result = generate_with_fallback(tts, item.text_en, sid, args.speed)
+                result = generate_with_fallback(tts, item.text_en, sid, item.item_type)
                 total_items += 1
 
                 if result is None:
@@ -506,12 +544,10 @@ def parse_args() -> argparse.Namespace:
             f"Mặc định (sửa ở biến READING_IDS đầu file): {DEFAULT_READING_IDS}"
         ),
     )
-    parser.add_argument(
-        "--speed",
-        type=float,
-        default=DEFAULT_SPEED,
-        help=f"Tốc độ đọc. Mặc định (biến SPEED đầu file): {DEFAULT_SPEED}",
-    )
+    # ⚠️ Đã BỎ --speed — tốc độ giờ tự động theo item_type (word/sentence/
+    # phrase), xem SPEED_WORD/SPEED_SENTENCE/SPEED_PHRASE ở khối CẤU HÌNH
+    # đầu file. Muốn đổi tốc độ, sửa trực tiếp 3 hằng số đó, không truyền
+    # cờ dòng lệnh nữa.
     parser.add_argument(
         "--num-threads",
         type=int,

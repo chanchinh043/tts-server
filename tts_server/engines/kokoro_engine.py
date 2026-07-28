@@ -98,7 +98,7 @@ class KokoroVoiceEngine(VoiceEngine):
         self._wav_tmp_dir = Path(wav_tmp_dir) if wav_tmp_dir else Path(tempfile.gettempdir()) / "tts_myreading_wav"
         self._wav_tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    def generate(self, text: str, sid: int, speed: float = 1.0) -> VoiceGenerationResult:
+    def generate(self, text: str, sid: int, item_type: str) -> VoiceGenerationResult:
         if not text or not text.strip():
             return VoiceGenerationResult(success=False, error="text rỗng, không có gì để generate")
 
@@ -106,8 +106,10 @@ class KokoroVoiceEngine(VoiceEngine):
             # generate_with_fallback() tự thử giọng gốc (sid) trước, hết
             # MAX_ATTEMPTS_PER_VOICE lần vẫn câm thì tự chuyển sang giọng
             # thay thế cùng nhóm (VOICE_GROUPS) — xem step1, KHÔNG cần logic
-            # fallback riêng ở đây, gọi thẳng là đủ.
-            result = generate_with_fallback(self._tts, text, sid, speed)
+            # fallback riêng ở đây, gọi thẳng là đủ. Tốc độ đọc cũng do
+            # step1 tự tra theo item_type (get_speed_for_type()) — KHÔNG
+            # còn truyền speed từ tầng này nữa, xem base.py.
+            result = generate_with_fallback(self._tts, text, sid, item_type)
         except Exception as e:
             logger.exception("generate: lỗi khi gọi generate_with_fallback (sid=%d)", sid)
             return VoiceGenerationResult(success=False, error=f"lỗi generate: {e}")

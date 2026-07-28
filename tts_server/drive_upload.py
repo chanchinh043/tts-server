@@ -50,6 +50,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -111,7 +112,44 @@ def _get_drive_service(token_path: str):
 
     if not credentials.valid:
         if credentials.expired and credentials.refresh_token:
-            credentials.refresh(Request())
+            try:
+                credentials.refresh(Request())
+            except RefreshError as e:
+                # ── invalid_grant: Token has been expired or revoked. ─────
+                # KHÔNG PHẢI lỗi mạng/lỗi tạm thời — refresh token đã CHẾT
+                # HẲN, KHÔNG cách nào tự phục hồi từ code (không có
+                # try-lại-sau-vài-giây nào cứu được). Nguyên nhân THƯỜNG
+                # GẶP NHẤT: OAuth Consent Screen của Cloud project này vẫn
+                # đang ở Publishing status = "Testing" — Google TỰ ĐỘNG hết
+                # hạn refresh token sau đúng 7 NGÀY trong chế độ đó, bất kể
+                # có dùng hay không. Nguyên nhân khác (ít gặp hơn): người
+                # dùng tự thu hồi quyền ở myaccount.google.com/permissions,
+                # đổi mật khẩu Google, hoặc token không được dùng >6 tháng.
+                #
+                # → Sửa dứt điểm: chuyển OAuth consent screen sang
+                #   "In production" (Google Cloud Console) để token không
+                #   còn tự hết hạn theo chu kỳ 7 ngày.
+                # → Sửa tạm ngay: chạy lại
+                #   'python -m tts_server.oauth_setup' để lấy token mới,
+                #   nhưng sẽ hỏng lại sau 7 ngày nếu chưa publish app.
+                logger.error(
+                    "_get_drive_service: refresh token tại %s ĐÃ HẾT HẠN/BỊ THU HỒI "
+                    "(invalid_grant) — KHÔNG tự phục hồi được. Nguyên nhân thường gặp "
+                    "nhất: OAuth consent screen còn ở chế độ 'Testing' (Google tự hết "
+                    "hạn refresh token sau 7 ngày trong chế độ này) — vào Google Cloud "
+                    "Console > OAuth consent screen > Publish App để sửa dứt điểm. "
+                    "Sửa tạm ngay: chạy 'python -m tts_server.oauth_setup' để lấy token "
+                    "mới. Lỗi gốc: %s",
+                    path, e,
+                )
+                raise RuntimeError(
+                    f"Refresh token tại {path} đã hết hạn hoặc bị thu hồi (invalid_grant). "
+                    f"Rất có thể do OAuth consent screen đang ở chế độ 'Testing' (token tự "
+                    f"hết hạn sau 7 ngày) — publish app trên Google Cloud Console để sửa dứt "
+                    f"điểm, hoặc chạy lại 'python -m tts_server.oauth_setup' để lấy token mới "
+                    f"ngay bây giờ (sẽ hỏng lại sau 7 ngày nếu chưa publish)."
+                ) from e
+
             # ── Ghi lại access token mới vừa refresh — access token cũ đã
             # hết hạn, KHÔNG ghi lại thì lần gọi kế tiếp lại phải refresh
             # từ đầu (vẫn hoạt động đúng nhưng tốn 1 lượt gọi mạng vô ích

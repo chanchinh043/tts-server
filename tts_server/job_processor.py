@@ -125,7 +125,10 @@ def _process_one_job(reading_id: str, sid: int, content_hash: str) -> None:
             failed_count += 1
             continue
 
-        gen_result = engine.generate(text=text_en, sid=sid)
+        # Tốc độ đọc do engine tự tra theo item_type (xem
+        # get_speed_for_type() trong step1_generate_kokoro_audio.py) — job
+        # processor chỉ cần truyền đúng item_type, không tự tính speed.
+        gen_result = engine.generate(text=text_en, sid=sid, item_type=item_type)
         if not gen_result.success or not gen_result.wav_path:
             logger.warning(
                 "_process_one_job: %s generate lỗi cho item_id=%s type=%s: %s",

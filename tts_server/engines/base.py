@@ -62,19 +62,22 @@ class VoiceEngine(ABC):
     """
 
     @abstractmethod
-    def generate(self, text: str, sid: int, speed: float = 1.0) -> VoiceGenerationResult:
+    def generate(self, text: str, sid: int, item_type: str) -> VoiceGenerationResult:
         """Sinh audio cho ĐÚNG 1 đoạn text (1 item: sentence/word/phrase).
 
-        text:  nội dung cần đọc (textEn của 1 item — xem MyReadingItem ở
-               main.py). KHÔNG rỗng — caller nên tự lọc item rỗng trước khi
-               gọi tới đây (đúng tinh thần "interface không lo việc lọc dữ
-               liệu, chỉ lo việc sinh audio").
-        sid:   speaker id / chỉ số giọng — khớp đúng ý nghĩa `sid` đã dùng
-               xuyên suốt pipeline (TtsMyReadingRequestClient.kt, jobs.py,
-               step1_generate_kokoro_audio.py).
-        speed: tốc độ đọc, mặc định 1.0 (bình thường) — engine nào không hỗ
-               trợ chỉnh tốc độ có thể bỏ qua tham số này (implement vẫn
-               phải nhận, chỉ đơn giản không dùng).
+        text:      nội dung cần đọc (textEn của 1 item — xem MyReadingItem ở
+                   main.py). KHÔNG rỗng — caller nên tự lọc item rỗng trước
+                   khi gọi tới đây.
+        sid:       speaker id / chỉ số giọng — khớp đúng ý nghĩa `sid` đã
+                   dùng xuyên suốt pipeline (TtsMyReadingRequestClient.kt,
+                   jobs.py, step1_generate_kokoro_audio.py).
+        item_type: "word" | "sentence" | "phrase" — engine tự tra tốc độ
+                   đọc tương ứng (xem get_speed_for_type() trong
+                   step1_generate_kokoro_audio.py, DUY NHẤT nơi quyết định
+                   tốc độ theo loại item). Caller KHÔNG tự tính/truyền speed
+                   nữa — mọi engine implement interface này đều nhận
+                   item_type để tự quyết định tốc độ nhất quán giữa server
+                   MyReading và batch script bài hệ thống.
 
         Trả về VoiceGenerationResult — KHÔNG throw exception ra ngoài trong
         trường hợp lỗi sinh audio thông thường (model không handle được
