@@ -24,3 +24,7 @@ pending_upload.json
 # Editor
 .vscode/
 .idea/
+
+#bỏ qua thư mục generate thủ công
+generated_audio/
+db/
